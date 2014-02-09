@@ -19,19 +19,17 @@
 #include <time.h>
 #include <string.h>
 
-// FIXME
-#define DEBUG
-
 // Preprocessor macros
 #define MAX_PORTS_SCANNED 1024
 #define MAX_FILTERED_RETRIES 3
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 #define RAND_UINT16() ((uint16_t)rand() % (USHRT_MAX + 1))
 #define RAND_UINT32() ((uint32_t)rand() % UINT_MAX)
+#define RAND_UINT32_RANGE(f, t) ((uint32_t)(rand() % ((t) - (f)) + (f)))
 
 // Debugging macros
 #ifdef DEBUG
-#define DEBUG_PRINTF(fmt, va...) fprintf(stderr, fmt, ##va)
+#define DEBUG_PRINTF(fmt, va...) fprintf(stderr, fmt "\n", ##va)
 #else
 #define DEBUG_PRINTF(_, ...)
 #endif
@@ -50,7 +48,7 @@
 	       "protocol: %u\n" \
 	       "check: %x\n" \
 	       "saddr: %u\n" \
-	       "daddr: %u\n\n", \
+	       "daddr: %u\n", \
 	       (p)->version, (p)->ihl, (p)->tos, ntohs((p)->tot_len), ntohs((p)->id), (ntohs((p)->frag_off) & 0xC000) >> 12, ntohs((p)->frag_off) & 0x3FFF, (p)->ttl, (p)->protocol, ntohs((p)->check), ntohl((p)->saddr), ntohl((p)->daddr)); \
 	(void)p; \
 } while (0)
@@ -71,7 +69,7 @@
 	       "urg: %u\n" \
 	       "window: %u\n" \
 	       "check: %x\n" \
-	       "urg_prt: %u\n\n", \
+	       "urg_ptr: %u\n", \
 	       ntohs((p)->source), ntohs((p)->dest), ntohl((p)->seq), ntohl((p)->ack_seq), (p)->doff, (p)->fin, (p)->syn, (p)->rst, (p)->psh, (p)->ack, (p)->urg, ntohs((p)->window), ntohs((p)->check), ntohs((p)->urg_ptr)); \
 	(void)p; \
 } while (0)
@@ -90,7 +88,7 @@ typedef enum {
 
 typedef enum {
 	METHOD_UNKNOWN = -1,
-	METHOD_SYN,
+	METHOD_SYN = 0,
 } eScanMethod;
 
 typedef enum {
@@ -123,6 +121,8 @@ typedef struct ports_list_s {
 typedef struct scan_config_s {
 	int verbose;
 	int fingerprint_services;
+	int no_delay;
+
 	eScanMethod method;
 	char const *target_address;
 	struct sockaddr *target_sockaddr;
@@ -247,21 +247,25 @@ static uint8_t await_fd_state(int fd, eFdState state, uint64_t usec) {
 
 	FD_ZERO(&fds);
 	FD_SET(fd, &fds);
-	if (state == STATE_READ) {
-		r = select(fd + 1, &fds, NULL, NULL, NULL);
-	} else if (state == STATE_WRITE) {
-		r = select(fd + 1, NULL, &fds, NULL, NULL);
-	} else if (state == STATE_TIMEOUT) {
-		r = select(0, NULL, NULL, NULL, &tv);
-	} else {
-		return 1;
+	switch (state) {
+		case STATE_READ:
+			r = select(fd + 1, &fds, NULL, NULL, usec ? &tv : NULL);
+			break;
+		case STATE_WRITE:
+			r = select(fd + 1, NULL, &fds, NULL, usec ? &tv : NULL);
+			break;
+		case STATE_TIMEOUT:
+			r = select(0, NULL, NULL, NULL, &tv);
+			break;
+		default: return 1;
 	}
 
 	if (r < 0)
 		return 1;
 
-	if (state == STATE_TIMEOUT
-	    || FD_ISSET(fd, &fds))
+	if (state == STATE_TIMEOUT)
+		return 2;
+	else if (FD_ISSET(fd, &fds))
 		return 0;
 
 	return 1;
@@ -363,6 +367,7 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *taddr, uint16_t port) 
 	sin.sin_port = htons(port);
 	sin.sin_addr.s_addr = ((struct sockaddr_in*)taddr)->sin_addr.s_addr;
 
+	DEBUG_PRINTF("Sent packet:");
 	DEBUG_PRINT_IPV4(packet);
 	DEBUG_PRINT_TCPV4(packet + ((struct iphdr*)packet)->ihl * sizeof(uint32_t));
 
@@ -381,6 +386,8 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *taddr, uint16_t port) 
 		uint32_t i;
 		uint8_t read_state;
 		ssize_t len;
+		struct sockaddr_in addr;
+		socklen_t addr_len;
 
 		i = 0;
 		do {
@@ -396,7 +403,8 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *taddr, uint16_t port) 
 				return STATUS_FILTERED;
 		} while (read_state == 2);
 
-		len = recv(sock, buffer, ARRAY_SIZE(buffer), 0);
+		addr_len = sizeof(struct sockaddr_in);
+		len = recvfrom(sock, buffer, ARRAY_SIZE(buffer), 0, (struct sockaddr*)&addr, &addr_len);
 		if (len < 0) {
 			return STATUS_UNKNOWN;
 		}
@@ -412,12 +420,15 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *taddr, uint16_t port) 
 			continue;
 		}
 
+		tcph = (struct tcphdr*)(buffer + iph->ihl * sizeof(uint32_t));
+
+		DEBUG_PRINTF("Received packet:");
 		DEBUG_PRINT_IPV4(iph);
 		DEBUG_PRINT_TCPV4(tcph);
 
-		tcph = (struct tcphdr*)(buffer + iph->ihl * sizeof(uint32_t));
-		if (ntohs(tcph->source) != port) {
-			// wrong port
+		if (ntohs(tcph->source) != port
+		    || addr.sin_addr.s_addr != ((struct sockaddr_in*)taddr)->sin_addr.s_addr) {
+			// either wrong port, or the packet doesn't come from the target
 			continue;
 		}
 
@@ -460,6 +471,8 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 		ePortStatus s;
 		eService ss;
 
+		DEBUG_PRINTF("Scanning port #%u", ports[i]);
+
 		ss = SERVICE_UNKNOWN;
 		s = scan_port(sock, ports[i], conf);
 		if ((s & STATUS_OPEN) == STATUS_OPEN)
@@ -469,41 +482,69 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 			fprintf(stderr, "Memory exhausted\n");
 			return NULL;
 		}
+
+		if (!conf->no_delay) {
+			uint32_t delay_usec;
+
+			delay_usec = RAND_UINT32_RANGE(500, 3000);
+			DEBUG_PRINTF("Delay: %uµs", delay_usec);
+			await_fd_state(0, STATE_TIMEOUT, delay_usec * 1000);
+		}
 	}
 
 	return pl;
 }
 
 static void print_report(ports_list_t *report, int verbose) {
-	char const * const head_fmt = "%7s   %10s   %s\n";
-	char const * const entry_fmt = "%7d | %10s . %s\n";
+	char const * const head_fmt  = "%7s   %9s  %s\n";
+	char const * const entry_fmt = "%7d | %9s  %s\n";
+	uint32_t closed_ports;
+	uint32_t unknown_ports;
 
 	fprintf(stdout, head_fmt, "port", "status", "service");
 
 	uint32_t i;
-	for (i = 0; i < MAX_PORTS_SCANNED; i++) {
+	for (i = 0, closed_ports = 0, unknown_ports = 0; i < MAX_PORTS_SCANNED; i++) {
 		ports_list_t *pl;
 
 		pl = report;
 		while (pl) {
 			if (i == pl->port) {
-				if ((pl->status != STATUS_UNKNOWN
-				     && pl->status != STATUS_CLOSED)
-				    || verbose)
-					fprintf(stdout, entry_fmt, pl->port, ps_to_str(pl->status), pss_to_str(pl->service));
+				if (pl->status != STATUS_CLOSED) {
+					switch (pl->status) {
+						case STATUS_CLOSED:
+							closed_ports++;
+							break;
+						case STATUS_UNKNOWN:
+							unknown_ports++;
+							break;
+						default:
+							fprintf(stdout, entry_fmt, pl->port, ps_to_str(pl->status), pss_to_str(pl->service));
+							break;
+					}
+				}
+
 				break;
 			}
 
 			pl = pl->next;
 		}
 	}
+
+	if (verbose) {
+		if (closed_ports)
+			fprintf(stdout, "Amount of ports closed: %u\n", closed_ports);
+		if (unknown_ports)
+			fprintf(stdout, "Couldn't determine the state of %u ports\n", unknown_ports);
+	}
 }
 
 static void usage(char const *av) {
-	fprintf(stdout, "Usage: %s [-v] [-f] [-h | -m <method>] <target address>\n", av);
+	fprintf(stdout, "Usage: %s [-v] [-f] [-d] [-h | -m <method>] <target address>\n", av);
 	fprintf(stdout, "\t-v: enable verbose mode (default: disabled)\n"
 			"\t-m: scan method (default: SYN)\n"
-			"\t-f: enable services fingerprinting (default: disabled)\n");
+			"\t-f: enable services fingerprinting (default: disabled)\n"
+			"\t-d: disable random delay between ports (default: enabled)\n");
 }
 
 static int set_config(int ac, char **av, scan_config_t *conf) {
@@ -512,7 +553,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 	bzero(conf, sizeof(scan_config_t));
 
 	conf->method = METHOD_SYN;
-	while ((opt = getopt(ac, av, "hvfm:")) != -1) {
+	while ((opt = getopt(ac, av, "hvfdm:")) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(*av);
@@ -522,6 +563,9 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				break;
 			case 'f':
 				conf->fingerprint_services = 1;
+				break;
+			case 'd':
+				conf->no_delay = 1;
 				break;
 			case 'm': {
 				uint32_t i;
@@ -537,7 +581,6 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				break;
 			}
 			default:
-				fprintf(stderr, "Unknown option '%c'\n", opt);
 				return 1;
 		}
 	}
@@ -588,7 +631,7 @@ int main(int ac, char **av) {
 	}
 
 	if (conf.verbose)
-		fprintf(stdout, "Scan summary: host:%s ports:0-%d method:%u\n", conf.target_address, MAX_PORTS_SCANNED, conf.method);
+		fprintf(stdout, "Scan summary: host:%s(%s) ports:0-%d method:%s\n", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), MAX_PORTS_SCANNED - 1, port_scanners_ref[conf.method].str);
 
 	report = scan_ports(sock, &conf);
 	print_report(report, conf.verbose);
