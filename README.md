@@ -18,12 +18,12 @@ known as «stealth scanning».
 * IPv4 only
 
 ``
-Usage: ./tsps [-h | OPTIONS ] <target address> 
-Available options: 
-	-v: enable verbose mode (default: disabled) 
-		-m <method>: scan method (default: SYN) 
-		-f: enable services fingerprinting (default: disabled) 
-		-d: disable random delay between ports (default: enabled) 
-		-n <number>: amount of ports to be scanned (default: 2014) 
-		-i <iface>: interface to use (default will be automatically detected) 
+Usage: ./tsps [-h | OPTIONS ] <target address>  
+Available options:  
+	-v: enable verbose mode (default: disabled)  
+		-m <method>: scan method (default: SYN)  
+		-f: enable services fingerprinting (default: disabled)  
+		-d: disable random delay between ports (default: enabled)  
+		-n <number>: amount of ports to be scanned (default: 2014)  
+		-i <iface>: interface to use (default will be automatically detected)  
 ``
