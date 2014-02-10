@@ -626,6 +626,8 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				conf->no_delay = 1;
 				break;
 			case 'm': {
+				conf->method = METHOD_UNKNOWN;
+
 				uint32_t i;
 				for (i = 0; i < ARRAY_SIZE(port_scanners_ref); i++) {
 					if (!strcasecmp(port_scanners_ref[i].str, optarg)) {
@@ -644,10 +646,11 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				int n;
 
 				n = atoi(optarg);
-				if (n < 1
-				    || n > INT16_MAX) {
+				if (n > INT16_MAX) {
 					fprintf(stderr, "Invalid amount of ports: %d\n", n);
 					return 1;
+				} else if (n == -1) {
+					n = UINT16_MAX;
 				}
 
 				conf->ports_amount = (uint16_t)n;
