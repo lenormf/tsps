@@ -18,6 +18,8 @@
 #include <limits.h>
 #include <time.h>
 #include <string.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 // Preprocessor macros
 #define MAX_PORTS_SCANNED 1024
@@ -122,10 +124,14 @@ typedef struct scan_config_s {
 	int verbose;
 	int fingerprint_services;
 	int no_delay;
+	uint16_t ports_amount;
 
 	eScanMethod method;
 	char const *target_address;
 	struct sockaddr *target_sockaddr;
+
+	char const *iface_name;
+	struct sockaddr *iface_sockaddr;
 } scan_config_t;
 
 struct tcp_pseudo_header_s {
@@ -134,6 +140,23 @@ struct tcp_pseudo_header_s {
 	uint8_t zero;
 	uint8_t protocol;
 	uint16_t length;
+};
+
+// Lookup tables
+static struct {
+	eService service;
+	char const *s;
+} const ss_ref[] = {
+	{SERVICE_UNKNOWN, "unknown"},
+	{SERVICE_SSH, "ssh"},
+};
+
+void crafter_tcp4(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
+static struct {
+	ePacketType type;
+	void (*craft)(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
+} const packet_crafters_ref[] = {
+	{PACKET_TCP4, &crafter_tcp4},
 };
 
 // Utils/private functions
@@ -171,14 +194,6 @@ static char const *ps_to_str(ePortStatus st) {
 	return NULL;
 }
 
-static struct {
-	eService service;
-	char const *s;
-} const ss_ref[] = {
-	{SERVICE_UNKNOWN, "unknown"},
-	{SERVICE_SSH, "ssh"},
-};
-
 static char const *pss_to_str(eService ss) {
 	uint32_t i;
 	for (i = 0; i < ARRAY_SIZE(ss_ref); i++)
@@ -208,6 +223,39 @@ static struct sockaddr *dn_to_sockaddr(char const *dn) {
 	freeaddrinfo(results);
 
 	return &ret;
+}
+
+static struct sockaddr *iface_to_sockaddr(char const *iface_name) {
+	static struct sockaddr ret;
+	struct sockaddr *r;
+	struct ifaddrs *ifap;
+
+	if (getifaddrs(&ifap) < 0)
+		return NULL;
+
+	r = NULL;
+	struct ifaddrs *iface;
+	for (iface = ifap; iface; iface = iface->ifa_next) {
+		if (iface->ifa_addr->sa_family != AF_INET
+		    || (iface->ifa_flags & IFF_LOOPBACK) == IFF_LOOPBACK
+		    || (iface->ifa_flags & IFF_UP) != IFF_UP)
+			continue;
+
+		if (iface_name
+		    && strcmp(iface_name, iface->ifa_name))
+			continue;
+
+		DEBUG_PRINTF("Interface detected: %s", iface->ifa_name);
+
+		r = &ret;
+		memcpy(&ret, iface->ifa_addr, sizeof(struct sockaddr));
+
+		break;
+	}
+
+	freeifaddrs(ifap);
+
+	return r;
 }
 
 static void array_shuffle(uint16_t *a, size_t n) {
@@ -272,7 +320,7 @@ static uint8_t await_fd_state(int fd, eFdState state, uint64_t usec) {
 }
 
 // Packet crafters
-void crafter_ip4(char *buffer, struct sockaddr *taddr, uint8_t target_protocol) {
+void crafter_ip4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, uint8_t target_protocol) {
 	struct iphdr *head = (struct iphdr*)buffer;
 
 	head->ihl = 5;
@@ -284,7 +332,7 @@ void crafter_ip4(char *buffer, struct sockaddr *taddr, uint8_t target_protocol) 
 	head->protocol = target_protocol;
 	head->check = htons(0);
 	// FIXME
-	head->saddr = inet_addr("192.168.1.24");//htons(RAND_UINT32());
+	head->saddr = ((struct sockaddr_in*)saddr)->sin_addr.s_addr;
 	head->daddr = ((struct sockaddr_in*)taddr)->sin_addr.s_addr;
 
 	switch (target_protocol) {
@@ -296,12 +344,12 @@ void crafter_ip4(char *buffer, struct sockaddr *taddr, uint8_t target_protocol) 
 	}
 }
 
-void crafter_tcp4(char *buffer, struct sockaddr *taddr, uint16_t port, uint16_t options) {
+void crafter_tcp4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port, uint16_t options) {
 	struct iphdr *iphead;
 	struct tcphdr *tcphead;
 	struct tcp_pseudo_header_s pseudo;
 
-	crafter_ip4(buffer, taddr, IPPROTO_TCP);
+	crafter_ip4(buffer, saddr, taddr, IPPROTO_TCP);
 
 	iphead = (struct iphdr*)buffer;
 	tcphead = (struct tcphdr*)(buffer + iphead->ihl * sizeof(uint32_t));
@@ -349,19 +397,12 @@ void crafter_tcp4(char *buffer, struct sockaddr *taddr, uint16_t port, uint16_t 
 	tcphead->check = tcp4_checksum((uint16_t*)buff, sizeof(struct tcp_pseudo_header_s) + ntohs(pseudo.length));
 }
 
-static struct {
-	ePacketType type;
-	void (*craft)(char*, struct sockaddr*, uint16_t, uint16_t);
-} const packet_crafters_ref[] = {
-	{PACKET_TCP4, &crafter_tcp4},
-};
-
 // Port scanners
-static ePortStatus scanner_syn(int sock, struct sockaddr *taddr, uint16_t port) {
+static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port) {
 	struct sockaddr_in sin;
 	char packet[128];
 
-	packet_crafters_ref[PACKET_TCP4].craft(packet, taddr, port, FLAG_SYN);
+	packet_crafters_ref[PACKET_TCP4].craft(packet, saddr, taddr, port, FLAG_SYN);
 
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(port);
@@ -444,13 +485,13 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *taddr, uint16_t port) 
 static struct {
 	eScanMethod method;
 	char const *str;
-	ePortStatus (*scanner)(int, struct sockaddr*, uint16_t);
+	ePortStatus (*scanner)(int, struct sockaddr*, struct sockaddr*, uint16_t);
 } const port_scanners_ref[] = {
 	{METHOD_SYN, "SYN", &scanner_syn},
 };
 
 static ePortStatus scan_port(int sock, uint16_t port, scan_config_t const *conf) {
-	return port_scanners_ref[conf->method].scanner(sock, conf->target_sockaddr, port);
+	return port_scanners_ref[conf->method].scanner(sock, conf->iface_sockaddr, conf->target_sockaddr, port);
 }
 
 static eService scan_service(uint16_t port) {
@@ -459,15 +500,21 @@ static eService scan_service(uint16_t port) {
 
 static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 	ports_list_t *pl;
-	uint16_t ports[MAX_PORTS_SCANNED];
+	uint16_t *ports;
 	unsigned int i;
 
-	pl = NULL;
-	for (i = 0; i < ARRAY_SIZE(ports); i++)
-		ports[i] = i;
-	array_shuffle(ports, ARRAY_SIZE(ports));
+	ports = malloc(conf->ports_amount * sizeof(uint16_t));
+	if (!ports) {
+		fprintf(stderr, "Memory exhausted\n");
+		return NULL;
+	}
 
-	for (i = 0; i < ARRAY_SIZE(ports); i++) {
+	pl = NULL;
+	for (i = 0; i < conf->ports_amount; i++)
+		ports[i] = i;
+	array_shuffle(ports, conf->ports_amount);
+
+	for (i = 0; i < conf->ports_amount; i++) {
 		ePortStatus s;
 		eService ss;
 
@@ -495,7 +542,7 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 	return pl;
 }
 
-static void print_report(ports_list_t *report, int verbose) {
+static void print_report(ports_list_t *report, uint16_t list_size, int verbose) {
 	char const * const head_fmt  = "%7s   %9s  %s\n";
 	char const * const entry_fmt = "%7d | %9s  %s\n";
 	uint32_t closed_ports;
@@ -504,7 +551,7 @@ static void print_report(ports_list_t *report, int verbose) {
 	fprintf(stdout, head_fmt, "port", "status", "service");
 
 	uint32_t i;
-	for (i = 0, closed_ports = 0, unknown_ports = 0; i < MAX_PORTS_SCANNED; i++) {
+	for (i = 0, closed_ports = 0, unknown_ports = 0; i < list_size; i++) {
 		ports_list_t *pl;
 
 		pl = report;
@@ -532,19 +579,22 @@ static void print_report(ports_list_t *report, int verbose) {
 	}
 
 	if (verbose) {
+		fprintf(stdout, "Amount of ports scanned: %hd\n", list_size);
 		if (closed_ports)
 			fprintf(stdout, "Amount of ports closed: %u\n", closed_ports);
 		if (unknown_ports)
-			fprintf(stdout, "Couldn't determine the state of %u ports\n", unknown_ports);
+			fprintf(stdout, "Couldn't determine the state of %u port%c\n", unknown_ports, unknown_ports <= 1 ? 0 : 's');
 	}
 }
 
 static void usage(char const *av) {
-	fprintf(stdout, "Usage: %s [-v] [-f] [-d] [-h | -m <method>] <target address>\n", av);
-	fprintf(stdout, "\t-v: enable verbose mode (default: disabled)\n"
-			"\t-m: scan method (default: SYN)\n"
+	fprintf(stdout, "Usage: %s [-h | OPTIONS ] <target address>\n", av);
+	fprintf(stdout, "Available options:\n"
+			"\t-v: enable verbose mode (default: disabled)\n"
+			"\t-m <method>: scan method (default: SYN)\n"
 			"\t-f: enable services fingerprinting (default: disabled)\n"
-			"\t-d: disable random delay between ports (default: enabled)\n");
+			"\t-d: disable random delay between ports (default: enabled)\n"
+			"\t-n <number>: amount of ports to be scanned (default: 2014)");
 }
 
 static int set_config(int ac, char **av, scan_config_t *conf) {
@@ -552,8 +602,9 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 
 	bzero(conf, sizeof(scan_config_t));
 
+	conf->ports_amount = MAX_PORTS_SCANNED;
 	conf->method = METHOD_SYN;
-	while ((opt = getopt(ac, av, "hvfdm:")) != -1) {
+	while ((opt = getopt(ac, av, "hvfdm:n:i:")) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(*av);
@@ -569,15 +620,35 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				break;
 			case 'm': {
 				uint32_t i;
-				for (i = 0; i < ARRAY_SIZE(port_scanners_ref); i++)
+				for (i = 0; i < ARRAY_SIZE(port_scanners_ref); i++) {
 					if (!strcasecmp(port_scanners_ref[i].str, optarg)) {
 						conf->method = port_scanners_ref[i].method;
 						break;
 					}
+				}
+
 				if (conf->method == METHOD_UNKNOWN) {
 					fprintf(stderr, "Unsupported scanning method \"%s\"\n", optarg);
 					return 1;
 				}
+				break;
+			}
+			case 'n': {
+				int n;
+
+				n = atoi(optarg);
+				if (n < 1
+				    || n > INT16_MAX) {
+					fprintf(stderr, "Invalid amount of ports: %d\n", n);
+					return 1;
+				}
+
+				conf->ports_amount = (uint16_t)n;
+
+				break;
+			}
+			case 'i': {
+				conf->iface_name = strdup(optarg);
 				break;
 			}
 			default:
@@ -595,6 +666,12 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 	conf->target_sockaddr = dn_to_sockaddr(conf->target_address);
 	if (!conf->target_sockaddr) {
 		fprintf(stderr, "Unable to resolve address\n");
+		return 1;
+	}
+
+	conf->iface_sockaddr = iface_to_sockaddr(conf->iface_name);
+	if (!conf->iface_sockaddr) {
+		fprintf(stderr, "Unable to get the interface's address\n");
 		return 1;
 	}
 
@@ -631,14 +708,15 @@ int main(int ac, char **av) {
 	}
 
 	if (conf.verbose)
-		fprintf(stdout, "Scan summary: host:%s(%s) ports:0-%d method:%s\n", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), MAX_PORTS_SCANNED - 1, port_scanners_ref[conf.method].str);
+		fprintf(stdout, "Scan summary: host:%s(%s) ports:0-%d method:%s iface:%s\n", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), conf.ports_amount - 1, port_scanners_ref[conf.method].str, conf.iface_name ? conf.iface_name : "default");
 
 	report = scan_ports(sock, &conf);
-	print_report(report, conf.verbose);
+	print_report(report, conf.ports_amount, conf.verbose);
 
 	close(sock);
 	for (; report != NULL; report = report->next)
 		free(report);
+	free((void*)conf.iface_name);
 
 	return 0;
 }
