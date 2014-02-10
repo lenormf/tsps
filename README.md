@@ -38,8 +38,8 @@ Unless you want it to, _TSPS_ will try to stay under the radar when scanning a h
 ## Examples
 
 * Stealth scan with random ports order, random delay between the ports being scanned (system ports)
-	``# ./tsps -v scanme.nmap.org``
+	* ``# ./tsps -v scanme.nmap.org``
 * Stealth scan with random ports order, no delay between the ports being scanned, and service fingerprinting enabled
-	``# ./tsps -v -d -f scanme.nmap.org``
+	* ``# ./tsps -v -d -f scanme.nmap.org``
 * Stealth scan with random ports order, service fingerprinting on a special interface, but only system ports
-	``# ./tsps -v -n 1024 -f -i vboxnet0 scanme.nmap.org``
+	* ``# ./tsps -v -n 1024 -f -i vboxnet0 scanme.nmap.org``
