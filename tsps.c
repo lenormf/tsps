@@ -78,6 +78,7 @@
 
 // Types
 typedef enum {
+	PACKET_IP4,
 	PACKET_TCP4,
 } ePacketType;
 
@@ -151,12 +152,23 @@ static struct {
 	{SERVICE_SSH, "ssh"},
 };
 
-void crafter_tcp4(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
+static void crafter_tcp4(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
+static void crafter_ip4(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
 static struct {
 	ePacketType type;
 	void (*craft)(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
 } const packet_crafters_ref[] = {
+	{PACKET_IP4, &crafter_ip4},
 	{PACKET_TCP4, &crafter_tcp4},
+};
+
+static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port);
+static struct {
+	eScanMethod method;
+	char const *str;
+	ePortStatus (*scanner)(int, struct sockaddr*, struct sockaddr*, uint16_t);
+} const port_scanners_ref[] = {
+	{METHOD_SYN, "SYN", &scanner_syn},
 };
 
 // Utils/private functions
@@ -320,8 +332,10 @@ static uint8_t await_fd_state(int fd, eFdState state, uint64_t usec) {
 }
 
 // Packet crafters
-void crafter_ip4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, uint8_t target_protocol) {
+static void crafter_ip4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t target_protocol, uint16_t options) {
 	struct iphdr *head = (struct iphdr*)buffer;
+
+	(void)options;
 
 	head->ihl = 5;
 	head->version = 4;
@@ -329,9 +343,8 @@ void crafter_ip4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, u
 	head->id = htons(RAND_UINT16());
 	head->frag_off = htons(0x4000);
 	head->ttl = 0x40;
-	head->protocol = target_protocol;
+	head->protocol = (uint8_t)target_protocol;
 	head->check = htons(0);
-	// FIXME
 	head->saddr = ((struct sockaddr_in*)saddr)->sin_addr.s_addr;
 	head->daddr = ((struct sockaddr_in*)taddr)->sin_addr.s_addr;
 
@@ -344,12 +357,12 @@ void crafter_ip4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, u
 	}
 }
 
-void crafter_tcp4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port, uint16_t options) {
+static void crafter_tcp4(char *buffer, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port, uint16_t options) {
 	struct iphdr *iphead;
 	struct tcphdr *tcphead;
 	struct tcp_pseudo_header_s pseudo;
 
-	crafter_ip4(buffer, saddr, taddr, IPPROTO_TCP);
+	packet_crafters_ref[PACKET_IP4].craft(buffer, saddr, taddr, IPPROTO_TCP, 0);
 
 	iphead = (struct iphdr*)buffer;
 	tcphead = (struct tcphdr*)(buffer + iphead->ihl * sizeof(uint32_t));
@@ -482,14 +495,6 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr
 	return STATUS_OPEN;
 }
 
-static struct {
-	eScanMethod method;
-	char const *str;
-	ePortStatus (*scanner)(int, struct sockaddr*, struct sockaddr*, uint16_t);
-} const port_scanners_ref[] = {
-	{METHOD_SYN, "SYN", &scanner_syn},
-};
-
 static ePortStatus scan_port(int sock, uint16_t port, scan_config_t const *conf) {
 	return port_scanners_ref[conf->method].scanner(sock, conf->iface_sockaddr, conf->target_sockaddr, port);
 }
@@ -594,7 +599,9 @@ static void usage(char const *av) {
 			"\t-m <method>: scan method (default: SYN)\n"
 			"\t-f: enable services fingerprinting (default: disabled)\n"
 			"\t-d: disable random delay between ports (default: enabled)\n"
-			"\t-n <number>: amount of ports to be scanned (default: 2014)");
+			"\t-n <number>: amount of ports to be scanned (default: 2014)\n"
+			"\t-i <iface>: interface to use (default will be automatically detected)\n");
+	fprintf(stdout, "Certain scanning methods require superuser privileges, in order to be able to create raw sockets\n");
 }
 
 static int set_config(int ac, char **av, scan_config_t *conf) {
