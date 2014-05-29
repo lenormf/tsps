@@ -27,3 +27,6 @@ distclean: clean
 	rm -f $(NAME)
 
 re: distclean all
+
+debug:
+	@make NAME=$(NAME)_debug CFLAGS="$(CFLAGS) -ggdb -DDEBUG" re

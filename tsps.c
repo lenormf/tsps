@@ -20,21 +20,26 @@
 #include <string.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <errno.h>
 
 // Preprocessor macros
 #define MAX_PORTS_SCANNED 1024
 #define MAX_FILTERED_RETRIES 3
+#define MAX_TIMEOUT_READ_MS (200 * 1000)
+#define MAX_TIMEOUT_FILTER_S 2
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 #define RAND_UINT16() ((uint16_t)rand() % (USHRT_MAX + 1))
 #define RAND_UINT32() ((uint32_t)rand() % UINT_MAX)
 #define RAND_UINT32_RANGE(f, t) ((uint32_t)(rand() % ((t) - (f)) + (f)))
 
+// Logging macros
+#define LOG_TO_STREAM(s, fmt, va...) fprintf(s, fmt "\n", ##va)
+#define LOG_WARNING(fmt, va...) LOG_TO_STREAM(stdout, "[WARNING] " fmt, ##va)
+#define LOG_ERROR(fmt, va...) LOG_TO_STREAM(stderr, "[ERROR] " fmt, ##va)
+
 // Debugging macros
 #ifdef DEBUG
-#define DEBUG_PRINTF(fmt, va...) fprintf(stderr, fmt "\n", ##va)
-#else
-#define DEBUG_PRINTF(_, ...)
-#endif
+#define DEBUG_PRINTF(fmt, va...) fprintf(stderr, "[DEBUG] " fmt "\n", ##va)
 
 #define DEBUG_PRINT_IPV4(buff) do { \
 	struct iphdr *p = (struct iphdr*)(buff); \
@@ -75,6 +80,11 @@
 	       ntohs((p)->source), ntohs((p)->dest), ntohl((p)->seq), ntohl((p)->ack_seq), (p)->doff, (p)->fin, (p)->syn, (p)->rst, (p)->psh, (p)->ack, (p)->urg, ntohs((p)->window), ntohs((p)->check), ntohs((p)->urg_ptr)); \
 	(void)p; \
 } while (0)
+#else
+#define DEBUG_PRINTF(_, ...)
+#define DEBUG_PRINT_IPV4(_)
+#define DEBUG_PRINT_TCPV4(_)
+#endif
 
 // Types
 typedef enum {
@@ -112,6 +122,12 @@ typedef enum {
 	STATE_WRITE,
 	STATE_TIMEOUT,
 } eFdState;
+
+typedef enum {
+	STATE_REACHED_READY,
+	STATE_REACHED_TIMEOUT,
+	STATE_REACHED_ERROR,
+} eReachedState;
 
 typedef struct ports_list_s {
 	uint16_t port;
@@ -176,8 +192,10 @@ static ports_list_t *push_port(ports_list_t **pl, uint16_t port, ePortStatus sta
 	ports_list_t *new;
 
 	new = malloc(sizeof(ports_list_t));
-	if (!new)
+	if (!new) {
+		LOG_ERROR("[PUSH_PORT] Memory exhausted (malloc returned NULL)");
 		return NULL;
+	}
 
 	new->port = port;
 	new->service = service;
@@ -227,6 +245,7 @@ static struct sockaddr *dn_to_sockaddr(char const *dn) {
 	hints.ai_flags = 0;
 	hints.ai_protocol = 0;
 
+	DEBUG_PRINTF("[DN_TO_SOCKADDR] Resolving address \"%s\"", dn);
 	if (getaddrinfo(dn, NULL, &hints, &results) < 0)
 		return NULL;
 
@@ -237,30 +256,38 @@ static struct sockaddr *dn_to_sockaddr(char const *dn) {
 	return &ret;
 }
 
-static struct sockaddr *iface_to_sockaddr(char const *iface_name) {
+static struct sockaddr *iface_to_sockaddr(char const **iface_name) {
 	static struct sockaddr ret;
 	struct sockaddr *r;
 	struct ifaddrs *ifap;
 
+	DEBUG_PRINTF("[IFACE_TO_SOCKADDR] Getting the interfaces addresses");
 	if (getifaddrs(&ifap) < 0)
 		return NULL;
 
 	r = NULL;
 	struct ifaddrs *iface;
 	for (iface = ifap; iface; iface = iface->ifa_next) {
+		// No network address for the given interface
+		if (!iface->ifa_addr)
+			continue;
+
 		if (iface->ifa_addr->sa_family != AF_INET
 		    || (iface->ifa_flags & IFF_LOOPBACK) == IFF_LOOPBACK
 		    || (iface->ifa_flags & IFF_UP) != IFF_UP)
 			continue;
 
-		if (iface_name
-		    && strcmp(iface_name, iface->ifa_name))
+		if (*iface_name
+		    && strcmp(*iface_name, iface->ifa_name))
 			continue;
 
-		DEBUG_PRINTF("Interface detected: %s", iface->ifa_name);
+		DEBUG_PRINTF("[IFACE_TO_SOCKADDR] Interface detected: %s", iface->ifa_name);
 
 		r = &ret;
 		memcpy(&ret, iface->ifa_addr, sizeof(struct sockaddr));
+
+		if (!*iface_name)
+			*iface_name = strdup(iface->ifa_name);
 
 		break;
 	}
@@ -297,6 +324,13 @@ static uint16_t tcp4_checksum(uint16_t *buffer, int size) {
 	return (uint16_t)(~cksum);
 }
 
+// Wait for a certain activity type to occur on a socket
+// Return values:
+// unknown state passed: -1
+// the socket is now in the awaited state: 0
+// timeout reached and STATE_TIMEOUT was passed: 0
+// an error occured while multiplexing the socket: 1
+// timeout reached and STATE_TIMEOUT was NOT passed: 2
 static uint8_t await_fd_state(int fd, eFdState state, uint64_t usec) {
 	int r;
 	fd_set fds;
@@ -320,15 +354,35 @@ static uint8_t await_fd_state(int fd, eFdState state, uint64_t usec) {
 		default: return 1;
 	}
 
-	if (r < 0)
+	if (r < 0) {
+		LOG_ERROR("[AWAIT_FD_STATE] File descriptor multiplexing error");
 		return 1;
+	}
 
-	if (state == STATE_TIMEOUT)
-		return 2;
-	else if (FD_ISSET(fd, &fds))
+	if (state == STATE_TIMEOUT || FD_ISSET(fd, &fds))
 		return 0;
 
-	return 1;
+	return (usec ? 2 : 1);
+}
+
+static eReachedState await_fd_state_ntries(int fd, eFdState state, uint64_t usec, uint32_t n) {
+	uint32_t j;
+	uint8_t st;
+
+	for (j = 0; j < n; j++) {
+		st = await_fd_state(fd, state, usec);
+		switch (st) {
+			case 0: break;
+			case 1:
+				DEBUG_PRINTF("[AWAIT_FD_STATE_N] Random error (%d): %s", state, strerror(errno));
+				return STATE_REACHED_ERROR;
+			case 2:
+				DEBUG_PRINTF("[AWAIT_FD_STATE_N] Timeout reached");
+				return STATE_REACHED_TIMEOUT;
+		}
+	}
+
+	return STATE_REACHED_READY;
 }
 
 // Packet crafters
@@ -414,6 +468,7 @@ static void crafter_tcp4(char *buffer, struct sockaddr *saddr, struct sockaddr *
 static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port) {
 	struct sockaddr_in sin;
 	char packet[128];
+	time_t time_scan_started;
 
 	packet_crafters_ref[PACKET_TCP4].craft(packet, saddr, taddr, port, FLAG_SYN);
 
@@ -421,68 +476,78 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr
 	sin.sin_port = htons(port);
 	sin.sin_addr.s_addr = ((struct sockaddr_in*)taddr)->sin_addr.s_addr;
 
-	DEBUG_PRINTF("Sent packet:");
-	DEBUG_PRINT_IPV4(packet);
-	DEBUG_PRINT_TCPV4(packet + ((struct iphdr*)packet)->ihl * sizeof(uint32_t));
-
 	if (await_fd_state(sock, STATE_WRITE, 0))
 		return STATUS_UNKNOWN;
 
 	if (sendto(sock, packet, ntohs(((struct iphdr*)packet)->tot_len), 0, (struct sockaddr*)&sin, sizeof(struct sockaddr_in)) < 0) {
-		fprintf(stderr, "Unable to send packet (port %hd)\n", port);
+		LOG_ERROR("[SCANNER_SYN] Unable to write to socket");
 		return STATUS_UNKNOWN;
 	}
+
+	// XXX
+	DEBUG_PRINTF("[PACKET] Sent packet:");
+	DEBUG_PRINT_IPV4(packet);
+	DEBUG_PRINT_TCPV4(packet + ((struct iphdr*)packet)->ihl * sizeof(uint32_t));
+
+	// FIXME: handle error on time()
+	time_scan_started = time(NULL);
 
 	char buffer[256];
 	struct iphdr *iph;
 	struct tcphdr *tcph;
 	while (1) {
-		uint32_t i;
-		uint8_t read_state;
 		ssize_t len;
 		struct sockaddr_in addr;
 		socklen_t addr_len;
+		eReachedState rst;
+		time_t actual_time;
 
-		i = 0;
-		do {
+		// FIXME: handle error on time()
+		actual_time = time(NULL);
 
-			i++;
-			read_state = await_fd_state(sock, STATE_READ, 200 * 1000);
-			if (read_state == 0)
-				break;
+		// 2s timeout on a filtered port
+		if (actual_time - time_scan_started >= MAX_TIMEOUT_FILTER_S)
+			return STATUS_FILTERED;
 
-			if (read_state == 1)
-				return STATUS_UNKNOWN;
-			else if (i >= MAX_FILTERED_RETRIES)
-				return STATUS_FILTERED;
-		} while (read_state == 2);
+		// XXX
+		DEBUG_PRINTF("Awaiting packet");
+
+		rst = await_fd_state_ntries(sock, STATE_READ, MAX_TIMEOUT_READ_MS, MAX_FILTERED_RETRIES);
+		if (rst == STATE_REACHED_TIMEOUT) {
+			return STATUS_FILTERED;
+		} else if (rst == STATE_REACHED_ERROR) {
+			return STATUS_UNKNOWN;
+		}
 
 		addr_len = sizeof(struct sockaddr_in);
 		len = recvfrom(sock, buffer, ARRAY_SIZE(buffer), 0, (struct sockaddr*)&addr, &addr_len);
 		if (len < 0) {
+			LOG_ERROR("[SCANNER_SYN] Couldn't read from socket");
 			return STATUS_UNKNOWN;
 		}
 
 		if ((size_t)len < sizeof(struct iphdr) + sizeof(struct tcphdr)) {
-			// packet too short
+			DEBUG_PRINTF("[SCANNER_SYN][PACKET] Packet too short to be parsed");
 			continue;
 		}
 
+		// XXX
+		DEBUG_PRINTF("[PACKET] Received packet:");
+
 		iph = (struct iphdr*)buffer;
+		// XXX
+		DEBUG_PRINT_IPV4(iph);
 		if (iph->protocol != IPPROTO_TCP) {
-			// not TCP
+			DEBUG_PRINTF("[PACKET] Packet isn't TCP");
 			continue;
 		}
 
 		tcph = (struct tcphdr*)(buffer + iph->ihl * sizeof(uint32_t));
-
-		DEBUG_PRINTF("Received packet:");
-		DEBUG_PRINT_IPV4(iph);
+		// XXX
 		DEBUG_PRINT_TCPV4(tcph);
-
 		if (ntohs(tcph->source) != port
 		    || addr.sin_addr.s_addr != ((struct sockaddr_in*)taddr)->sin_addr.s_addr) {
-			// either wrong port, or the packet doesn't come from the target
+			DEBUG_PRINTF("[SCANNER_SYN][PACKET] Different ports/addresses");
 			continue;
 		}
 
@@ -510,7 +575,7 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 
 	ports = malloc(conf->ports_amount * sizeof(uint16_t));
 	if (!ports) {
-		fprintf(stderr, "Memory exhausted\n");
+		LOG_ERROR("[SCAN_PORTS] Memory exhausted (malloc returned NULL)");
 		return NULL;
 	}
 
@@ -523,23 +588,21 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 		ePortStatus s;
 		eService ss;
 
-		DEBUG_PRINTF("Scanning port #%u", ports[i]);
+		DEBUG_PRINTF("[SCAN_PORTS] Scanning port #%u", ports[i]);
 
 		ss = SERVICE_UNKNOWN;
 		s = scan_port(sock, ports[i], conf);
 		if ((s & STATUS_OPEN) == STATUS_OPEN)
 			ss = scan_service(ports[i]);
 
-		if (!push_port(&pl, ports[i], s, ss)) {
-			fprintf(stderr, "Memory exhausted\n");
+		if (!push_port(&pl, ports[i], s, ss))
 			return NULL;
-		}
 
 		if (!conf->no_delay) {
 			uint32_t delay_usec;
 
 			delay_usec = RAND_UINT32_RANGE(500, 3000);
-			DEBUG_PRINTF("Delay: %uµs", delay_usec);
+			DEBUG_PRINTF("[SCAN_PORTS] Delay: %uµs", delay_usec);
 			await_fd_state(0, STATE_TIMEOUT, delay_usec * 1000);
 		}
 	}
@@ -552,11 +615,14 @@ static void print_report(ports_list_t *report, uint16_t list_size, int verbose) 
 	char const * const entry_fmt = "%7d | %9s  %s\n";
 	uint32_t closed_ports;
 	uint32_t unknown_ports;
+	uint32_t open_ports;
 
-	fprintf(stdout, head_fmt, "port", "status", "service");
+	closed_ports = 0;
+	unknown_ports = 0;
+	open_ports = 0;
 
 	uint32_t i;
-	for (i = 0, closed_ports = 0, unknown_ports = 0; i < list_size; i++) {
+	for (i = 0; i < list_size; i++) {
 		ports_list_t *pl;
 
 		pl = report;
@@ -571,6 +637,10 @@ static void print_report(ports_list_t *report, uint16_t list_size, int verbose) 
 							unknown_ports++;
 							break;
 						default:
+							if (!open_ports)
+								fprintf(stdout, head_fmt, "port", "status", "service");
+
+							open_ports++;
 							fprintf(stdout, entry_fmt, pl->port, ps_to_str(pl->status), pss_to_str(pl->service));
 							break;
 					}
@@ -585,6 +655,7 @@ static void print_report(ports_list_t *report, uint16_t list_size, int verbose) 
 
 	if (verbose) {
 		fprintf(stdout, "Amount of ports scanned: %hd\n", list_size);
+		fprintf(stdout, "Amount of ports open: %u\n", open_ports);
 		if (closed_ports)
 			fprintf(stdout, "Amount of ports closed: %u\n", closed_ports);
 		if (unknown_ports)
@@ -637,7 +708,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				}
 
 				if (conf->method == METHOD_UNKNOWN) {
-					fprintf(stderr, "Unsupported scanning method \"%s\"\n", optarg);
+					LOG_ERROR("[SET_CONFIG] Unsupported scanning method \"%s\"", optarg);
 					return 1;
 				}
 				break;
@@ -647,7 +718,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 
 				n = atoi(optarg);
 				if (n > INT16_MAX) {
-					fprintf(stderr, "Invalid amount of ports: %d\n", n);
+					LOG_ERROR("[SET_CONFIG] Invalid amount of ports: %d", n);
 					return 1;
 				} else if (n == -1) {
 					n = UINT16_MAX;
@@ -658,7 +729,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				break;
 			}
 			case 'i': {
-				conf->iface_name = strdup(optarg);
+				conf->iface_name = strndup(optarg, IFNAMSIZ);
 				break;
 			}
 			default:
@@ -667,7 +738,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 	}
 
 	if (optind >= ac) {
-		fprintf(stderr, "Option parsing error\n");
+		LOG_ERROR("[SET_CONFIG] Option parsing error");
 		return 1;
 	}
 
@@ -675,13 +746,13 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 
 	conf->target_sockaddr = dn_to_sockaddr(conf->target_address);
 	if (!conf->target_sockaddr) {
-		fprintf(stderr, "Unable to resolve address\n");
+		LOG_ERROR("[SET_CONFIG] Unable to resolve address");
 		return 1;
 	}
 
-	conf->iface_sockaddr = iface_to_sockaddr(conf->iface_name);
+	conf->iface_sockaddr = iface_to_sockaddr(&conf->iface_name);
 	if (!conf->iface_sockaddr) {
-		fprintf(stderr, "Unable to get the interface's address\n");
+		LOG_ERROR("[SET_CONFIG] Unable to get the interface's address");
 		return 1;
 	}
 
@@ -707,14 +778,19 @@ int main(int ac, char **av) {
 
 	sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
 	if (sock < 0) {
-		fprintf(stderr, "Unable to create socket\n");
+		LOG_ERROR("[MAIN] Unable to create socket");
 		return 3;
 	}
 
 	int const one = 1;
 	if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-		fprintf(stderr, "Unable to set options on the socket\n");
+		LOG_ERROR("[MAIN] Unable to set option \"IP_HDRINCL\" on the socket");
 		return 4;
+	}
+
+	if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, conf.iface_name, strlen(conf.iface_name)) < 0) {
+		LOG_ERROR("[MAIN] Unable to bind the socket to interface \"%s\"", conf.iface_name);
+		return 5;
 	}
 
 	if (conf.verbose)

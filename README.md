@@ -9,7 +9,7 @@ Download tsps.c to your file system, give it to your favorite C compiler and you
 * The code fits in one C file, is clear and maintainable.
 * No dependency
 
-## Stealth
+## Stealthy
 
 Unless you want it to, _TSPS_ will try to stay under the radar when scanning a host.
 
@@ -43,3 +43,12 @@ Unless you want it to, _TSPS_ will try to stay under the radar when scanning a h
 	* ``# ./tsps -v -d -f scanme.nmap.org``
 * Stealth scan with random ports order, service fingerprinting on a special interface, but only system ports
 	* ``# ./tsps -v -n 1024 -f -i vboxnet0 scanme.nmap.org``
+
+## Notes
+
+As the code is fairly modular, it should be easy to add support for more
+scanning methods (UDP, etc).
+
+The amount of false positives (ports detected as being "filtered" instead of
+"closed") will be substancially lower if you perform the scan when no
+connection is active already (SSH session, file downloads, etc).
