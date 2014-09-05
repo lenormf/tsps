@@ -199,20 +199,31 @@ static struct {
 };
 
 // Utils/private functions
-static ports_list_t *push_port(ports_list_t **pl, uint16_t port, ePortStatus status, eService service) {
+static ports_list_t *queue_port(ports_list_t **pl, uint16_t port, ePortStatus status, eService service) {
+    // Since we are not going to remove links between calls to queue_port(),
+    // it is safe to keep a static pointer to the tail of the list
+    static ports_list_t *tail;
 	ports_list_t *new;
 
 	new = malloc(sizeof(ports_list_t));
 	if (!new) {
-		LOG_ERROR("[PUSH_PORT] Memory exhausted (malloc returned NULL)");
+		LOG_ERROR("[QUEUE_PORT] Memory exhausted (malloc returned NULL)");
 		return NULL;
 	}
 
 	new->port = port;
 	new->service = service;
 	new->status = status;
-	new->next = *pl;
-	*pl = new;
+
+    new->next = NULL;
+
+    if (!*pl) {
+        *pl = new;
+        tail = new;
+    } else {
+        tail->next = new;
+        tail = new;
+    }
 
 	return new;
 }
@@ -630,7 +641,7 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
         }
 
         // Add the port to the results
-		if (!push_port(&pl, ports[i], s, ss)) {
+		if (!queue_port(&pl, ports[i], s, ss)) {
 			return NULL;
         }
 
@@ -651,49 +662,62 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 	return pl;
 }
 
-static void print_report(ports_list_t *report, uint16_t list_size, int verbose) {
+static void print_port_stats(ports_list_t const *port, unsigned int *open_ports, unsigned int *closed_ports, unsigned int *unknown_ports) {
 	char const * const head_fmt  = "%7s   %9s  %s\n";
 	char const * const entry_fmt = "%7d | %9s  %s\n";
-	uint32_t closed_ports;
-	uint32_t unknown_ports;
-	uint32_t open_ports;
+
+    if (port->status != STATUS_CLOSED) {
+        switch (port->status) {
+            case STATUS_CLOSED:
+                (*closed_ports)++;
+                break;
+            case STATUS_UNKNOWN:
+                (*unknown_ports)++;
+                break;
+            default:
+                if (!open_ports) {
+                    fprintf(stdout, head_fmt, "port", "status", "service");
+                }
+
+                (*open_ports)++;
+
+                fprintf(stdout, entry_fmt, port->port, ps_to_str(port->status), pss_to_str(port->service));
+
+                break;
+        }
+    }
+}
+
+static void print_report(ports_list_t *report, unsigned int list_size, int ordered, int verbose) {
+	unsigned int closed_ports;
+	unsigned int unknown_ports;
+	unsigned int open_ports;
 
 	closed_ports = 0;
 	unknown_ports = 0;
 	open_ports = 0;
 
-	uint32_t i;
-	for (i = 0; i < list_size; i++) {
-		ports_list_t *pl;
+    if (!ordered) {
+        uint32_t i;
 
-		pl = report;
-		while (pl) {
-			if (i == pl->port) {
-				if (pl->status != STATUS_CLOSED) {
-					switch (pl->status) {
-						case STATUS_CLOSED:
-							closed_ports++;
-							break;
-						case STATUS_UNKNOWN:
-							unknown_ports++;
-							break;
-						default:
-							if (!open_ports) {
-								fprintf(stdout, head_fmt, "port", "status", "service");
-                            }
+        for (i = 0; i < list_size; i++) {
+            ports_list_t const *pl;
 
-							open_ports++;
-							fprintf(stdout, entry_fmt, pl->port, ps_to_str(pl->status), pss_to_str(pl->service));
-							break;
-					}
-				}
+            pl = report;
+            while (pl) {
+                if (i == pl->port) {
+                    print_port_stats(pl, &open_ports, &closed_ports, &unknown_ports);
+                    break;
+                }
 
-				break;
-			}
-
-			pl = pl->next;
-		}
-	}
+                pl = pl->next;
+            }
+        }
+    } else {
+        for (; report; report = report->next) {
+            print_port_stats(report, &open_ports, &closed_ports, &unknown_ports);
+        }
+    }
 
 	if (verbose) {
 		fprintf(stdout, "Amount of ports scanned: %u\n", list_size);
@@ -855,7 +879,10 @@ int main(int ac, char **av) {
 
     // Start scanning, and display the results
 	report = scan_ports(sock, &conf);
-	print_report(report, conf.ports_amount, conf.verbose);
+
+    VERBOSE_PRINT(&conf, "Scan complete, generating results");
+
+	print_report(report, conf.ports_amount, conf.verbose, conf.no_shuffle);
 
 	close(sock);
 	for (; report != NULL; report = report->next)
