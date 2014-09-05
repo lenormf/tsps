@@ -141,6 +141,7 @@ typedef struct scan_config_s {
 	int verbose;
 	int fingerprint_services;
 	int no_delay;
+	int no_shuffle;
 	uint16_t ports_amount;
 
 	eScanMethod method;
@@ -218,8 +219,9 @@ static char const *ps_to_str(ePortStatus st) {
 	};
 	uint32_t i;
 	for (i = 0; i < ARRAY_SIZE(st_ref); i++)
-		if (st_ref[i].status == st)
+		if (st_ref[i].status == st) {
 			return st_ref[i].s;
+        }
 
 	return NULL;
 }
@@ -227,8 +229,9 @@ static char const *ps_to_str(ePortStatus st) {
 static char const *pss_to_str(eService ss) {
 	uint32_t i;
 	for (i = 0; i < ARRAY_SIZE(ss_ref); i++)
-		if (ss_ref[i].service == ss)
+		if (ss_ref[i].service == ss) {
 			return ss_ref[i].s;
+        }
 
 	return NULL;
 }
@@ -246,8 +249,9 @@ static struct sockaddr *dn_to_sockaddr(char const *dn) {
 	hints.ai_protocol = 0;
 
 	DEBUG_PRINTF("[DN_TO_SOCKADDR] Resolving address \"%s\"", dn);
-	if (getaddrinfo(dn, NULL, &hints, &results) < 0)
+	if (getaddrinfo(dn, NULL, &hints, &results) < 0) {
 		return NULL;
+    }
 
 	memcpy(&ret, results->ai_addr, sizeof(struct sockaddr));
 
@@ -262,15 +266,17 @@ static struct sockaddr *iface_to_sockaddr(char const **iface_name) {
 	struct ifaddrs *ifap;
 
 	DEBUG_PRINTF("[IFACE_TO_SOCKADDR] Getting the interfaces addresses");
-	if (getifaddrs(&ifap) < 0)
+	if (getifaddrs(&ifap) < 0) {
 		return NULL;
+    }
 
 	r = NULL;
 	struct ifaddrs *iface;
 	for (iface = ifap; iface; iface = iface->ifa_next) {
 		// No network address for the given interface
-		if (!iface->ifa_addr)
+		if (!iface->ifa_addr) {
 			continue;
+        }
 
 		if (iface->ifa_addr->sa_family != AF_INET
 		    || (iface->ifa_flags & IFF_LOOPBACK) == IFF_LOOPBACK
@@ -286,8 +292,9 @@ static struct sockaddr *iface_to_sockaddr(char const **iface_name) {
 		r = &ret;
 		memcpy(&ret, iface->ifa_addr, sizeof(struct sockaddr));
 
-		if (!*iface_name)
+		if (!*iface_name) {
 			*iface_name = strdup(iface->ifa_name);
+        }
 
 		break;
 	}
@@ -315,8 +322,9 @@ static uint16_t tcp4_checksum(uint16_t *buffer, int size) {
 		cksum += *buffer++;
 		size -= sizeof(uint16_t);
 	}
-	if (size)
+	if (size) {
 		cksum += *(uint16_t*)buffer;
+    }
 
 	cksum = (cksum >> 16) + (cksum & 0xFFFF);
 	cksum += (cksum >> 16);
@@ -359,8 +367,9 @@ static uint8_t await_fd_state(int fd, eFdState state, uint64_t usec) {
 		return 1;
 	}
 
-	if (state == STATE_TIMEOUT || FD_ISSET(fd, &fds))
+	if (state == STATE_TIMEOUT || FD_ISSET(fd, &fds)) {
 		return 0;
+    }
 
 	return (usec ? 2 : 1);
 }
@@ -436,11 +445,11 @@ static void crafter_tcp4(char *buffer, struct sockaddr *saddr, struct sockaddr *
 	tcphead->syn = 0;
 	tcphead->fin = 0;
 
-	if ((options & FLAG_FIN) == FLAG_FIN)
+	if ((options & FLAG_FIN) == FLAG_FIN) {
 		tcphead->fin = 1;
-	else if ((options & FLAG_SYN) == FLAG_SYN)
+    } else if ((options & FLAG_SYN) == FLAG_SYN) {
 		tcphead->syn = 1;
-	else if ((options & FLAG_XSMAS) == FLAG_XSMAS) {
+    } else if ((options & FLAG_XSMAS) == FLAG_XSMAS) {
 		tcphead->fin = 1;
 		tcphead->psh = 1;
 		tcphead->urg = 1;
@@ -476,8 +485,9 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr
 	sin.sin_port = htons(port);
 	sin.sin_addr.s_addr = ((struct sockaddr_in*)taddr)->sin_addr.s_addr;
 
-	if (await_fd_state(sock, STATE_WRITE, 0))
+	if (await_fd_state(sock, STATE_WRITE, 0)) {
 		return STATUS_UNKNOWN;
+    }
 
 	if (sendto(sock, packet, ntohs(((struct iphdr*)packet)->tot_len), 0, (struct sockaddr*)&sin, sizeof(struct sockaddr_in)) < 0) {
 		LOG_ERROR("[SCANNER_SYN] Unable to write to socket");
@@ -506,8 +516,9 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr
 		actual_time = time(NULL);
 
 		// 2s timeout on a filtered port
-		if (actual_time - time_scan_started >= MAX_TIMEOUT_FILTER_S)
+		if (actual_time - time_scan_started >= MAX_TIMEOUT_FILTER_S) {
 			return STATUS_FILTERED;
+        }
 
 		// XXX
 		DEBUG_PRINTF("Awaiting packet");
@@ -551,8 +562,9 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr
 			continue;
 		}
 
-		if (tcph->rst == 1)
+		if (tcph->rst == 1) {
 			return STATUS_CLOSED;
+        }
 
 		break;
 	}
@@ -579,10 +591,17 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 		return NULL;
 	}
 
+    // Generate a list of the ports number to be scanned
 	pl = NULL;
-	for (i = 0; i < conf->ports_amount; i++)
+	for (i = 0; i < conf->ports_amount; i++) {
 		ports[i] = i;
-	array_shuffle(ports, conf->ports_amount);
+    }
+
+    // Shuffle the list, if enabled
+    if (!conf->no_shuffle) {
+        DEBUG_PRINTF("[SCAN_PORTS] Shuffling the ports list");
+        array_shuffle(ports, conf->ports_amount);
+    }
 
 	for (i = 0; i < conf->ports_amount; i++) {
 		ePortStatus s;
@@ -591,13 +610,19 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 		DEBUG_PRINTF("[SCAN_PORTS] Scanning port #%u", ports[i]);
 
 		ss = SERVICE_UNKNOWN;
+        // Scan the port
 		s = scan_port(sock, ports[i], conf);
-		if ((s & STATUS_OPEN) == STATUS_OPEN)
+        // If the port is open, try to guess what service runs on it
+		if ((s & STATUS_OPEN) == STATUS_OPEN && conf->fingerprint_services) {
 			ss = scan_service(ports[i]);
+        }
 
-		if (!push_port(&pl, ports[i], s, ss))
+        // Add the port to the results
+		if (!push_port(&pl, ports[i], s, ss)) {
 			return NULL;
+        }
 
+        // Wait for a random amount of time (between 500ms and 3s) if enabled
 		if (!conf->no_delay) {
 			uint32_t delay_usec;
 
@@ -637,8 +662,9 @@ static void print_report(ports_list_t *report, uint16_t list_size, int verbose) 
 							unknown_ports++;
 							break;
 						default:
-							if (!open_ports)
+							if (!open_ports) {
 								fprintf(stdout, head_fmt, "port", "status", "service");
+                            }
 
 							open_ports++;
 							fprintf(stdout, entry_fmt, pl->port, ps_to_str(pl->status), pss_to_str(pl->service));
@@ -656,10 +682,12 @@ static void print_report(ports_list_t *report, uint16_t list_size, int verbose) 
 	if (verbose) {
 		fprintf(stdout, "Amount of ports scanned: %hd\n", list_size);
 		fprintf(stdout, "Amount of ports open: %u\n", open_ports);
-		if (closed_ports)
+		if (closed_ports) {
 			fprintf(stdout, "Amount of ports closed: %u\n", closed_ports);
-		if (unknown_ports)
+        }
+		if (unknown_ports) {
 			fprintf(stdout, "Couldn't determine the state of %u port%c\n", unknown_ports, unknown_ports <= 1 ? 0 : 's');
+        }
 	}
 }
 
@@ -670,6 +698,7 @@ static void usage(char const *av) {
 			"\t-m <method>: scan method (default: SYN)\n"
 			"\t-f: enable services fingerprinting (default: disabled)\n"
 			"\t-d: disable random delay between ports (default: enabled)\n"
+			"\t-s: disable random scan order of the ports (default: enabled)\n"
 			"\t-n <number>: amount of ports to be scanned (default: 2014)\n"
 			"\t-i <iface>: interface to use (default will be automatically detected)\n");
 	fprintf(stdout, "Certain scanning methods require superuser privileges, in order to be able to create raw sockets\n");
@@ -680,9 +709,10 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 
 	bzero(conf, sizeof(scan_config_t));
 
+    // Handle flags of the command line
 	conf->ports_amount = MAX_PORTS_SCANNED;
 	conf->method = METHOD_SYN;
-	while ((opt = getopt(ac, av, "hvfdm:n:i:")) != -1) {
+	while ((opt = getopt(ac, av, "hvfdsm:n:i:")) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(*av);
@@ -696,6 +726,9 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 			case 'd':
 				conf->no_delay = 1;
 				break;
+            case 's':
+                conf->no_shuffle = 1;
+                break;
 			case 'm': {
 				conf->method = METHOD_UNKNOWN;
 
@@ -744,12 +777,15 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 
 	conf->target_address = av[optind];
 
+    // Resolve the address of the target machine
 	conf->target_sockaddr = dn_to_sockaddr(conf->target_address);
 	if (!conf->target_sockaddr) {
 		LOG_ERROR("[SET_CONFIG] Unable to resolve address");
 		return 1;
 	}
 
+    // If an interface was provided, get its address
+    // Otherwise, grab the first available interface
 	conf->iface_sockaddr = iface_to_sockaddr(&conf->iface_name);
 	if (!conf->iface_sockaddr) {
 		LOG_ERROR("[SET_CONFIG] Unable to get the interface's address");
@@ -772,30 +808,37 @@ int main(int ac, char **av) {
 
 	srand(getpid() * time(NULL));
 
+    // Set all the scanning options according to the user's CLI flags
 	if (set_config(ac, av, &conf)) {
 		return 2;
 	}
 
+    // Create a raw socket (requires root rights)
+    // FIXME: socket type depends on the scanning method
 	sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
 	if (sock < 0) {
 		LOG_ERROR("[MAIN] Unable to create socket");
 		return 3;
 	}
 
+    // Hint the kernel that we will include the headers
 	int const one = 1;
 	if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
 		LOG_ERROR("[MAIN] Unable to set option \"IP_HDRINCL\" on the socket");
 		return 4;
 	}
 
+    // Bind the socket to a particular device
 	if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, conf.iface_name, strlen(conf.iface_name)) < 0) {
 		LOG_ERROR("[MAIN] Unable to bind the socket to interface \"%s\"", conf.iface_name);
 		return 5;
 	}
 
-	if (conf.verbose)
+	if (conf.verbose) {
 		fprintf(stdout, "Scan summary: host:%s(%s) ports:0-%d method:%s iface:%s\n", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), conf.ports_amount - 1, port_scanners_ref[conf.method].str, conf.iface_name ? conf.iface_name : "default");
+    }
 
+    // Start scanning, and display the results
 	report = scan_ports(sock, &conf);
 	print_report(report, conf.ports_amount, conf.verbose);
 
