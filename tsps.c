@@ -37,6 +37,8 @@
 #define LOG_WARNING(fmt, va...) LOG_TO_STREAM(stdout, "[WARNING] " fmt, ##va)
 #define LOG_ERROR(fmt, va...) LOG_TO_STREAM(stderr, "[ERROR] " fmt, ##va)
 
+#define VERBOSE_PRINT(conf, fmt, va...) if ((conf)->verbose) { LOG_TO_STREAM(stdout, fmt, ##va); }
+
 // Debugging macros
 #ifdef DEBUG
 #define DEBUG_PRINTF(fmt, va...) fprintf(stderr, "[DEBUG] " fmt "\n", ##va)
@@ -137,14 +139,21 @@ typedef struct ports_list_s {
 	struct ports_list_s *next;
 } ports_list_t;
 
+typedef struct socket_meta_s {
+    int domain;
+    int type;
+    int protocol;
+} socket_meta_t;
+
 typedef struct scan_config_s {
 	int verbose;
 	int fingerprint_services;
 	int no_delay;
 	int no_shuffle;
-	uint16_t ports_amount;
+	unsigned int ports_amount;
 
 	eScanMethod method;
+    socket_meta_t const *socket_meta;
 	char const *target_address;
 	struct sockaddr *target_sockaddr;
 
@@ -182,10 +191,11 @@ static struct {
 static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port);
 static struct {
 	eScanMethod method;
+    socket_meta_t const socket_meta;
 	char const *str;
 	ePortStatus (*scanner)(int, struct sockaddr*, struct sockaddr*, uint16_t);
 } const port_scanners_ref[] = {
-	{METHOD_SYN, "SYN", &scanner_syn},
+	{METHOD_SYN, {AF_INET, SOCK_RAW, IPPROTO_TCP}, "SYN", &scanner_syn},
 };
 
 // Utils/private functions
@@ -591,6 +601,8 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 		return NULL;
 	}
 
+    VERBOSE_PRINT(conf, "Generating the ports list");
+
     // Generate a list of the ports number to be scanned
 	pl = NULL;
 	for (i = 0; i < conf->ports_amount; i++) {
@@ -620,6 +632,10 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
         // Add the port to the results
 		if (!push_port(&pl, ports[i], s, ss)) {
 			return NULL;
+        }
+
+        if (conf->ports_amount > 19 && i && (i % (conf->ports_amount / 5)) == 0) {
+            VERBOSE_PRINT(conf, "Scanning progress: %d%%", i * 100 / conf->ports_amount);
         }
 
         // Wait for a random amount of time (between 500ms and 3s) if enabled
@@ -680,7 +696,7 @@ static void print_report(ports_list_t *report, uint16_t list_size, int verbose) 
 	}
 
 	if (verbose) {
-		fprintf(stdout, "Amount of ports scanned: %hd\n", list_size);
+		fprintf(stdout, "Amount of ports scanned: %u\n", list_size);
 		fprintf(stdout, "Amount of ports open: %u\n", open_ports);
 		if (closed_ports) {
 			fprintf(stdout, "Amount of ports closed: %u\n", closed_ports);
@@ -712,6 +728,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
     // Handle flags of the command line
 	conf->ports_amount = MAX_PORTS_SCANNED;
 	conf->method = METHOD_SYN;
+    conf->socket_meta = &port_scanners_ref[conf->method].socket_meta;
 	while ((opt = getopt(ac, av, "hvfdsm:n:i:")) != -1) {
 		switch (opt) {
 			case 'h':
@@ -736,6 +753,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				for (i = 0; i < ARRAY_SIZE(port_scanners_ref); i++) {
 					if (!strcasecmp(port_scanners_ref[i].str, optarg)) {
 						conf->method = port_scanners_ref[i].method;
+                        conf->socket_meta = &port_scanners_ref[i].socket_meta;
 						break;
 					}
 				}
@@ -750,14 +768,14 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				int n;
 
 				n = atoi(optarg);
-				if (n > INT16_MAX) {
+				if (n > UINT16_MAX + 1) {
 					LOG_ERROR("[SET_CONFIG] Invalid amount of ports: %d", n);
 					return 1;
 				} else if (n == -1) {
-					n = UINT16_MAX;
+					n = UINT16_MAX + 1;
 				}
 
-				conf->ports_amount = (uint16_t)n;
+				conf->ports_amount = n;
 
 				break;
 			}
@@ -771,7 +789,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 	}
 
 	if (optind >= ac) {
-		LOG_ERROR("[SET_CONFIG] Option parsing error");
+		LOG_ERROR("[SET_CONFIG] Option parsing error (not enough parameters)");
 		return 1;
 	}
 
@@ -813,9 +831,8 @@ int main(int ac, char **av) {
 		return 2;
 	}
 
-    // Create a raw socket (requires root rights)
-    // FIXME: socket type depends on the scanning method
-	sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    // Create a socket according to the method selected
+	sock = socket(conf.socket_meta->domain, conf.socket_meta->type, conf.socket_meta->protocol);
 	if (sock < 0) {
 		LOG_ERROR("[MAIN] Unable to create socket");
 		return 3;
@@ -834,9 +851,7 @@ int main(int ac, char **av) {
 		return 5;
 	}
 
-	if (conf.verbose) {
-		fprintf(stdout, "Scan summary: host:%s(%s) ports:0-%d method:%s iface:%s\n", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), conf.ports_amount - 1, port_scanners_ref[conf.method].str, conf.iface_name ? conf.iface_name : "default");
-    }
+	VERBOSE_PRINT(&conf, "Scan summary: host:%s(%s) ports:0-%d method:%s iface:%s", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), conf.ports_amount - 1, port_scanners_ref[conf.method].str, conf.iface_name ? conf.iface_name : "default");
 
     // Start scanning, and display the results
 	report = scan_ports(sock, &conf);
