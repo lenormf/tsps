@@ -21,6 +21,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <errno.h>
+#include <fcntl.h>
 
 // Preprocessor macros
 #define MAX_PORTS_SCANNED 1024
@@ -37,7 +38,7 @@
 #define LOG_WARNING(fmt, va...) LOG_TO_STREAM(stdout, "[WARNING] " fmt, ##va)
 #define LOG_ERROR(fmt, va...) LOG_TO_STREAM(stderr, "[ERROR] " fmt, ##va)
 
-#define VERBOSE_PRINT(conf, fmt, va...) if ((conf)->verbose) { LOG_TO_STREAM(stdout, fmt, ##va); }
+#define VERBOSE_PRINTF(conf, fmt, va...) if ((conf)->verbose) { LOG_TO_STREAM(stdout, fmt, ##va); }
 
 // Debugging macros
 #ifdef DEBUG
@@ -104,11 +105,12 @@ typedef enum {
 typedef enum {
 	METHOD_UNKNOWN = -1,
 	METHOD_SYN = 0,
+    METHOD_CONNECT,
 } eScanMethod;
 
 typedef enum {
-	SERVICE_UNKNOWN,
-	SERVICE_SSH,
+	SERVICE_UNKNOWN = -1,
+	SERVICE_SSH2 = 0,
 } eService;
 
 typedef enum {
@@ -135,25 +137,19 @@ typedef struct ports_list_s {
 	uint16_t port;
 	ePortStatus status;
 	eService service;
+    char meta[64];
 
 	struct ports_list_s *next;
 } ports_list_t;
 
-typedef struct socket_meta_s {
-    int domain;
-    int type;
-    int protocol;
-} socket_meta_t;
-
 typedef struct scan_config_s {
 	int verbose;
-	int fingerprint_services;
+	int no_fingerprint_services;
 	int no_delay;
 	int no_shuffle;
 	unsigned int ports_amount;
 
 	eScanMethod method;
-    socket_meta_t const *socket_meta;
 	char const *target_address;
 	struct sockaddr *target_sockaddr;
 
@@ -174,8 +170,16 @@ static struct {
 	eService service;
 	char const *s;
 } const ss_ref[] = {
-	{SERVICE_UNKNOWN, "unknown"},
-	{SERVICE_SSH, "ssh"},
+	{SERVICE_SSH2, "ssh 2.0"},
+};
+
+static struct {
+    eService service;
+    char const *req_buffer;
+    size_t req_buffer_sz;
+    char const *rep_fmt;
+} const service_fingerprints_ref[] = {
+    {SERVICE_SSH2, NULL, 0, "SSH-2.0-OpenSSH_%3s"},
 };
 
 static void crafter_tcp4(char*, struct sockaddr*, struct sockaddr*, uint16_t, uint16_t);
@@ -188,18 +192,23 @@ static struct {
 	{PACKET_TCP4, &crafter_tcp4},
 };
 
-static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port);
+static int create_raw_socket_tcp(void);
+static int create_nonblocking_socket_tcp(void); 
+
+static ePortStatus scanner_syn(int, struct sockaddr*, struct sockaddr*, uint16_t);
+static ePortStatus scanner_connect(int, struct sockaddr*, struct sockaddr*, uint16_t);
 static struct {
 	eScanMethod method;
-    socket_meta_t const socket_meta;
+    int (*socket_creator)(void);
 	char const *str;
 	ePortStatus (*scanner)(int, struct sockaddr*, struct sockaddr*, uint16_t);
 } const port_scanners_ref[] = {
-	{METHOD_SYN, {AF_INET, SOCK_RAW, IPPROTO_TCP}, "SYN", &scanner_syn},
+	{METHOD_SYN, &create_raw_socket_tcp, "SYN", &scanner_syn},
+    {METHOD_CONNECT, &create_nonblocking_socket_tcp, "CONNECT", &scanner_connect},
 };
 
 // Utils/private functions
-static ports_list_t *queue_port(ports_list_t **pl, uint16_t port, ePortStatus status, eService service) {
+static ports_list_t *queue_port(ports_list_t **pl, uint16_t port, ePortStatus status, eService service, char const *meta) {
     // Since we are not going to remove links between calls to queue_port(),
     // it is safe to keep a static pointer to the tail of the list
     static ports_list_t *tail;
@@ -214,6 +223,7 @@ static ports_list_t *queue_port(ports_list_t **pl, uint16_t port, ePortStatus st
 	new->port = port;
 	new->service = service;
 	new->status = status;
+    strncpy(new->meta, meta, ARRAY_SIZE(new->meta));
 
     new->next = NULL;
 
@@ -239,22 +249,34 @@ static char const *ps_to_str(ePortStatus st) {
 		{STATUS_FILTERED, "filtered"},
 	};
 	uint32_t i;
-	for (i = 0; i < ARRAY_SIZE(st_ref); i++)
+
+	for (i = 0; i < ARRAY_SIZE(st_ref); i++) {
 		if (st_ref[i].status == st) {
 			return st_ref[i].s;
         }
+    }
 
 	return NULL;
 }
 
 static char const *pss_to_str(eService ss) {
+#if 0
 	uint32_t i;
-	for (i = 0; i < ARRAY_SIZE(ss_ref); i++)
+
+	for (i = 0; i < ARRAY_SIZE(ss_ref); i++) {
 		if (ss_ref[i].service == ss) {
 			return ss_ref[i].s;
         }
+    }
 
 	return NULL;
+#endif
+
+    if (ss == SERVICE_UNKNOWN) {
+        return "unknown";
+    }
+
+    return ss_ref[(int)ss].s;
 }
 
 static struct sockaddr *dn_to_sockaddr(char const *dn) {
@@ -413,6 +435,41 @@ static eReachedState await_fd_state_ntries(int fd, eFdState state, uint64_t usec
 	}
 
 	return STATE_REACHED_READY;
+}
+
+// Socket creators
+int create_raw_socket_tcp(void) {
+    int sock;
+
+    sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (sock < 0) {
+        return sock;
+    }
+
+    // Hint the kernel that we will include the headers in the data passed to send()
+    int const one = 1;
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        LOG_ERROR("[CREATE_RAW_SOCKET_TCP] Unable to set option \"IP_HDRINCL\" on the socket");
+        return -1;
+    }
+
+    return sock;
+}
+
+int create_nonblocking_socket_tcp(void) {
+    int sock;
+
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        return sock;
+    }
+
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
+        LOG_ERROR("[CREATE_NONBLOCKING_SOCKET_TCP] Unable to set option \"O_NONBLOCK\" on the socket");
+        return -1;
+    }
+
+    return sock;
 }
 
 // Packet crafters
@@ -593,12 +650,98 @@ static ePortStatus scanner_syn(int sock, struct sockaddr *saddr, struct sockaddr
 	return STATUS_OPEN;
 }
 
+static ePortStatus scanner_connect(int sock, struct sockaddr *saddr, struct sockaddr *taddr, uint16_t port) {
+    struct sockaddr_in sin;
+    int connected;
+    socklen_t connected_sz;
+
+    (void)saddr;
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(port);
+	sin.sin_addr.s_addr = ((struct sockaddr_in*)taddr)->sin_addr.s_addr;
+
+    connect(sock, (struct sockaddr*)&sin, sizeof(struct sockaddr));
+
+    if (await_fd_state(sock, STATE_WRITE, 0)) {
+        return STATUS_UNKNOWN;
+    }
+
+    connected_sz = sizeof(int);
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &connected, &connected_sz)) {
+        return STATUS_UNKNOWN;
+    }
+
+    if (connected) {
+        LOG_ERROR("%s", strerror(connected));
+        return STATUS_CLOSED;
+    }
+
+    shutdown(sock, SHUT_RDWR);
+
+    return STATUS_OPEN;
+}
+
 static ePortStatus scan_port(int sock, uint16_t port, scan_config_t const *conf) {
 	return port_scanners_ref[conf->method].scanner(sock, conf->iface_sockaddr, conf->target_sockaddr, port);
 }
 
-static eService scan_service(uint16_t port) {
-	return SERVICE_UNKNOWN;
+static eService scan_service(struct sockaddr *target, uint16_t port, eScanMethod method, char *meta, size_t meta_sz) {
+    struct sockaddr_in *sin;
+    eService service;
+    unsigned int i;
+    int sock;
+
+    switch (method) {
+        case METHOD_SYN:
+        case METHOD_CONNECT:
+            sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            break;
+
+        default:
+            sock = -1;
+            break;
+    }
+
+    if (sock < 0) {
+        return SERVICE_UNKNOWN;
+    }
+
+    sin = (struct sockaddr_in*)target;
+    sin->sin_port = htons(port);
+
+    service = SERVICE_UNKNOWN;
+    if (connect(sock, (struct sockaddr*)sin, sizeof(struct sockaddr)) < 0) {
+        goto exit;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(service_fingerprints_ref); i++) {
+        char buffer[512];
+        ssize_t buffer_sz;
+
+        if (service_fingerprints_ref[i].req_buffer) {
+            await_fd_state(sock, STATE_WRITE, 500);
+            if (send(sock, service_fingerprints_ref[i].req_buffer, service_fingerprints_ref[i].req_buffer_sz, 0) < 0) {
+                goto exit;
+            }
+        }
+
+        buffer_sz = recv(sock, buffer, ARRAY_SIZE(buffer) - 1, 0);
+        if (buffer_sz < 0) {
+            goto exit;
+        }
+        buffer[buffer_sz] = 0;
+
+        bzero(meta, meta_sz);
+        if (sscanf(buffer, service_fingerprints_ref[i].rep_fmt, meta) > 0) {
+            service = service_fingerprints_ref[i].service;
+            break;
+        }
+    }
+
+exit:
+    close(sock);
+
+	return service;
 }
 
 static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
@@ -612,7 +755,7 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 		return NULL;
 	}
 
-    VERBOSE_PRINT(conf, "Generating the ports list");
+    VERBOSE_PRINTF(conf, "Generating the ports list");
 
     // Generate a list of the ports number to be scanned
 	pl = NULL;
@@ -626,27 +769,33 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
         array_shuffle(ports, conf->ports_amount);
     }
 
+    VERBOSE_PRINTF(conf, "Scanning started");
+
 	for (i = 0; i < conf->ports_amount; i++) {
 		ePortStatus s;
 		eService ss;
+        char meta[64];
 
 		DEBUG_PRINTF("[SCAN_PORTS] Scanning port #%u", ports[i]);
 
-		ss = SERVICE_UNKNOWN;
         // Scan the port
 		s = scan_port(sock, ports[i], conf);
+
+        ss = SERVICE_UNKNOWN;
+        *meta = 0;
+
         // If the port is open, try to guess what service runs on it
-		if ((s & STATUS_OPEN) == STATUS_OPEN && conf->fingerprint_services) {
-			ss = scan_service(ports[i]);
+		if ((s & STATUS_OPEN) == STATUS_OPEN && !conf->no_fingerprint_services) {
+			ss = scan_service(conf->target_sockaddr, ports[i], conf->method, meta, ARRAY_SIZE(meta));
         }
 
         // Add the port to the results
-		if (!queue_port(&pl, ports[i], s, ss)) {
+		if (!queue_port(&pl, ports[i], s, ss, meta)) {
 			return NULL;
         }
 
         if (conf->ports_amount > 19 && i && (i % (conf->ports_amount / 5)) == 0) {
-            VERBOSE_PRINT(conf, "Scanning progress: %d%%", i * 100 / conf->ports_amount);
+            VERBOSE_PRINTF(conf, "Scanning progress: %d%%", i * 100 / conf->ports_amount);
         }
 
         // Wait for a random amount of time (between 500ms and 3s) if enabled
@@ -662,33 +811,40 @@ static ports_list_t *scan_ports(int sock, scan_config_t const *conf) {
 	return pl;
 }
 
-static void print_port_stats(ports_list_t const *port, unsigned int *open_ports, unsigned int *closed_ports, unsigned int *unknown_ports) {
+static void print_port_stats(ports_list_t const *port, unsigned int *open_ports, unsigned int *closed_ports, unsigned int *unknown_ports, int services_scanned) {
 	char const * const head_fmt  = "%7s   %9s  %s\n";
-	char const * const entry_fmt = "%7d | %9s  %s\n";
+	char const * const entry_fmt = "%7d | %9s  unknown\n";
+	char const * const entry_fmt_open = "%7d | %9s  %s [%s]\n";
 
-    if (port->status != STATUS_CLOSED) {
-        switch (port->status) {
-            case STATUS_CLOSED:
-                (*closed_ports)++;
-                break;
-            case STATUS_UNKNOWN:
-                (*unknown_ports)++;
-                break;
-            default:
-                if (!open_ports) {
-                    fprintf(stdout, head_fmt, "port", "status", "service");
-                }
+    switch (port->status) {
+        case STATUS_CLOSED:
+            (*closed_ports)++;
+            break;
 
-                (*open_ports)++;
+        case STATUS_UNKNOWN:
+            (*unknown_ports)++;
+            break;
 
-                fprintf(stdout, entry_fmt, port->port, ps_to_str(port->status), pss_to_str(port->service));
+        case STATUS_FILTERED:
+        case STATUS_OPEN:
+            if (!*open_ports) {
+                fprintf(stdout, head_fmt, "port", "status", "service");
+            }
 
-                break;
-        }
+            (*open_ports)++;
+
+            if (port->status == STATUS_OPEN && services_scanned) {
+                fprintf(stdout, entry_fmt_open, port->port, ps_to_str(port->status), pss_to_str(port->service), *port->meta ? port->meta : "none");
+            } else {
+                fprintf(stdout, entry_fmt, port->port, ps_to_str(port->status));
+            }
+
+            break;
+        default: break;
     }
 }
 
-static void print_report(ports_list_t *report, unsigned int list_size, int ordered, int verbose) {
+static void print_report(ports_list_t *report, unsigned int list_size, int verbose, int ordered, int services_scanned) {
 	unsigned int closed_ports;
 	unsigned int unknown_ports;
 	unsigned int open_ports;
@@ -706,7 +862,7 @@ static void print_report(ports_list_t *report, unsigned int list_size, int order
             pl = report;
             while (pl) {
                 if (i == pl->port) {
-                    print_port_stats(pl, &open_ports, &closed_ports, &unknown_ports);
+                    print_port_stats(pl, &open_ports, &closed_ports, &unknown_ports, services_scanned);
                     break;
                 }
 
@@ -715,13 +871,13 @@ static void print_report(ports_list_t *report, unsigned int list_size, int order
         }
     } else {
         for (; report; report = report->next) {
-            print_port_stats(report, &open_ports, &closed_ports, &unknown_ports);
+            print_port_stats(report, &open_ports, &closed_ports, &unknown_ports, services_scanned);
         }
     }
 
 	if (verbose) {
 		fprintf(stdout, "Amount of ports scanned: %u\n", list_size);
-		fprintf(stdout, "Amount of ports open: %u\n", open_ports);
+		fprintf(stdout, "Amount of ports open/filtered: %u\n", open_ports);
 		if (closed_ports) {
 			fprintf(stdout, "Amount of ports closed: %u\n", closed_ports);
         }
@@ -736,7 +892,7 @@ static void usage(char const *av) {
 	fprintf(stdout, "Available options:\n"
 			"\t-v: enable verbose mode (default: disabled)\n"
 			"\t-m <method>: scan method (default: SYN)\n"
-			"\t-f: enable services fingerprinting (default: disabled)\n"
+			"\t-f: disable services fingerprinting (default: enabled)\n"
 			"\t-d: disable random delay between ports (default: enabled)\n"
 			"\t-s: disable random scan order of the ports (default: enabled)\n"
 			"\t-n <number>: amount of ports to be scanned (default: 2014)\n"
@@ -752,7 +908,6 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
     // Handle flags of the command line
 	conf->ports_amount = MAX_PORTS_SCANNED;
 	conf->method = METHOD_SYN;
-    conf->socket_meta = &port_scanners_ref[conf->method].socket_meta;
 	while ((opt = getopt(ac, av, "hvfdsm:n:i:")) != -1) {
 		switch (opt) {
 			case 'h':
@@ -762,7 +917,7 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				conf->verbose = 1;
 				break;
 			case 'f':
-				conf->fingerprint_services = 1;
+				conf->no_fingerprint_services = 1;
 				break;
 			case 'd':
 				conf->no_delay = 1;
@@ -777,7 +932,6 @@ static int set_config(int ac, char **av, scan_config_t *conf) {
 				for (i = 0; i < ARRAY_SIZE(port_scanners_ref); i++) {
 					if (!strcasecmp(port_scanners_ref[i].str, optarg)) {
 						conf->method = port_scanners_ref[i].method;
-                        conf->socket_meta = &port_scanners_ref[i].socket_meta;
 						break;
 					}
 				}
@@ -856,17 +1010,10 @@ int main(int ac, char **av) {
 	}
 
     // Create a socket according to the method selected
-	sock = socket(conf.socket_meta->domain, conf.socket_meta->type, conf.socket_meta->protocol);
+    sock = port_scanners_ref[conf.method].socket_creator();
 	if (sock < 0) {
 		LOG_ERROR("[MAIN] Unable to create socket");
 		return 3;
-	}
-
-    // Hint the kernel that we will include the headers
-	int const one = 1;
-	if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-		LOG_ERROR("[MAIN] Unable to set option \"IP_HDRINCL\" on the socket");
-		return 4;
 	}
 
     // Bind the socket to a particular device
@@ -875,14 +1022,14 @@ int main(int ac, char **av) {
 		return 5;
 	}
 
-	VERBOSE_PRINT(&conf, "Scan summary: host:%s(%s) ports:0-%d method:%s iface:%s", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), conf.ports_amount - 1, port_scanners_ref[conf.method].str, conf.iface_name ? conf.iface_name : "default");
+	VERBOSE_PRINTF(&conf, "Scan summary: host:%s(%s) ports:0-%d method:%s iface:%s", conf.target_address, inet_ntoa(((struct sockaddr_in*)conf.target_sockaddr)->sin_addr), conf.ports_amount - 1, port_scanners_ref[conf.method].str, conf.iface_name ? conf.iface_name : "default");
 
     // Start scanning, and display the results
 	report = scan_ports(sock, &conf);
 
-    VERBOSE_PRINT(&conf, "Scan complete, generating results");
+    VERBOSE_PRINTF(&conf, "Scan complete, generating results");
 
-	print_report(report, conf.ports_amount, conf.verbose, conf.no_shuffle);
+	print_report(report, conf.ports_amount, conf.verbose, conf.no_shuffle, !conf.no_fingerprint_services);
 
 	close(sock);
 	for (; report != NULL; report = report->next)
